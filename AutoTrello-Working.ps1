@@ -8,606 +8,949 @@
 #     * fallback : crée label sans couleur si tout échoue
 # - Crée chaque carte + description + checklist "DoD", applique le label si fourni.
 # - NOUVEAU : Sauvegarde l'URL du board et sélection interactive des listes/labels
+# - PRESET KANBAN : Création automatique de listes Kanban standard
 # ============================================================================
 
-# Encodage : ISE n'a pas de vrai ConsoleHost -> protège l'appel
-try { if ($host.Name -eq 'ConsoleHost') { [Console]::OutputEncoding = [Text.UTF8Encoding]::UTF8 } } catch {}
+<# ===============================================================
+  AutoTrello - Création automatique de cartes Trello
+  Version corrigée avec appels API fonctionnels
+  =============================================================== #>
 
+# === CONFIG ===
+$ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-# -------------------- Gestion des identifiants Trello --------------------
-# Utiliser le répertoire courant si $PSScriptRoot est vide
-$ScriptDir = if ([string]::IsNullOrWhiteSpace($PSScriptRoot)) { Get-Location } else { $PSScriptRoot }
-$ConfigFile = Join-Path $ScriptDir "trello-config.json"
+# === VARIABLES GLOBALES ===
+$script:Key = $null
+$script:Token = $null
+$script:Base = "https://api.trello.com/1"
+$script:ConfigPath = Join-Path $PSScriptRoot "trello-config.json"
 
-function Load-TrelloConfig {
-  Write-Host "Recherche du fichier de configuration : $ConfigFile" -ForegroundColor Gray
-  if (Test-Path $ConfigFile) {
+# ============================================================================
+# FONCTIONS DE CONFIGURATION
+# ============================================================================
+
+function Get-TrelloConfig {
+  Write-Host "`n=== CONFIGURATION TRELLO ===" -ForegroundColor Cyan
+  Write-Host "Pour obtenir votre KEY et TOKEN, allez sur : https://trello.com/app-key" -ForegroundColor Yellow
+  
+  # Charger config existante
+  Write-Host "Recherche du fichier de configuration : $script:ConfigPath" -ForegroundColor Gray
+  if (Test-Path $script:ConfigPath) {
     Write-Host "Fichier de configuration trouvé" -ForegroundColor Green
     try {
-      $config = Get-Content $ConfigFile | ConvertFrom-Json
+      $config = Get-Content $script:ConfigPath -Raw | ConvertFrom-Json
       Write-Host "Configuration chargée avec succès" -ForegroundColor Green
-      return $config
+      Write-Host "Configuration trouvée du $($config.LastUpdated)" -ForegroundColor Gray
+      
+      Write-Host "Options :" -ForegroundColor Yellow
+      Write-Host "  [O] Utiliser les identifiants sauvegardés" -ForegroundColor White
+      Write-Host "  [N] Saisir de nouveaux identifiants" -ForegroundColor White
+      Write-Host "  [M] Modifier la configuration existante" -ForegroundColor White
+      $choice = Read-Host "Votre choix (O/n/m)"
+      
+      if ($choice -eq "" -or $choice -eq "O" -or $choice -eq "o") {
+        Write-Host "✅ Utilisation des identifiants sauvegardés" -ForegroundColor Green
+        $script:Key = $config.Key
+        $script:Token = $config.Token
+        return
+      } elseif ($choice -eq "M" -or $choice -eq "m") {
+        Write-Host "Modification de la configuration..." -ForegroundColor Cyan
+      }
     } catch {
-      Write-Warning "Fichier de configuration corrompu, sera recréé. Erreur: $($_.Exception.Message)"
+      Write-Warning "Erreur lors du chargement de la configuration : $_"
     }
   } else {
     Write-Host "Fichier de configuration non trouvé" -ForegroundColor Yellow
+    Write-Host "Aucune configuration sauvegardée trouvée." -ForegroundColor Gray
   }
-  return $null
+  
+  # Demander les identifiants
+  $keyInput = Read-Host "Trello API KEY (laisser vide pour utiliser `$env:TRELLO_KEY)"
+  $script:Key = if ([string]::IsNullOrWhiteSpace($keyInput)) { $env:TRELLO_KEY } else { $keyInput }
+  
+  $tokenInput = Read-Host "Trello TOKEN (laisser vide pour utiliser `$env:TRELLO_TOKEN)"
+  $script:Token = if ([string]::IsNullOrWhiteSpace($tokenInput)) { $env:TRELLO_TOKEN } else { $tokenInput }
+  
+  if ([string]::IsNullOrWhiteSpace($script:Key) -or [string]::IsNullOrWhiteSpace($script:Token)) {
+    throw "❌ Clé/Token manquants. Renseignez `$Key et `$Token."
+  }
+  
+  # Sauvegarder
+  $save = Read-Host "Sauvegarder ces identifiants pour la prochaine fois ? (O/n)"
+  if ($save -eq "" -or $save -eq "O" -or $save -eq "o") {
+    $configObj = @{
+      Key = $script:Key
+      Token = $script:Token
+      LastUpdated = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+    }
+    $configObj | ConvertTo-Json | Set-Content $script:ConfigPath
+    Write-Host "✅ Configuration Trello sauvegardée localement" -ForegroundColor Green
+  }
 }
 
-function Save-TrelloConfig {
-  param([string]$Key, [string]$Token, [string]$BoardUrl)
-  $config = @{
-    Key = $Key
-    Token = $Token
-    BoardUrl = $BoardUrl
-    LastUpdated = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-  }
-  $config | ConvertTo-Json | Set-Content $ConfigFile -Encoding UTF8
-  Write-Host "✅ Configuration Trello sauvegardée localement" -ForegroundColor Green
+# ============================================================================
+# FONCTIONS D'APPEL API (MÉTHODE FONCTIONNELLE)
+# ============================================================================
+
+function Invoke-TrelloGet {
+  param([string]$Uri)
+  $authQuery = "key=$script:Key&token=$script:Token"
+  $sep = if ($Uri -match '\?') { '&' } else { '?' }
+  $fullUri = "$Uri$sep$authQuery"
+  Invoke-RestMethod -Uri $fullUri -Method Get
 }
 
-function Load-BoardConfig {
-  param([string]$BoardUrl)
-  $configFile = Join-Path $ScriptDir "board-config-$BoardUrl.json"
-  if (Test-Path $configFile) {
-    try {
-      $config = Get-Content $configFile | ConvertFrom-Json
-      Write-Host "Configuration du board trouvée : $BoardUrl" -ForegroundColor Green
-      return $config
-    } catch {
-      Write-Warning "Fichier de configuration du board corrompu : $configFile. Erreur: $($_.Exception.Message)"
+function Invoke-TrelloPost {
+  param(
+    [string]$Uri,
+    [hashtable]$Body
+  )
+  # CRITIQUE : key et token DANS le Body pour POST
+  $postBody = @{
+    key = $script:Key
+    token = $script:Token
+  }
+  foreach ($key in $Body.Keys) {
+    $postBody[$key] = $Body[$key]
+  }
+  
+  Invoke-RestMethod `
+    -Uri $Uri `
+    -Method Post `
+    -Body $postBody `
+    -ContentType "application/x-www-form-urlencoded"
+}
+
+# ============================================================================
+# FONCTIONS DE SÉLECTION DE BOARD
+# ============================================================================
+
+function Resolve-Board {
+  param([string]$Input)
+  
+  $raw = if ($Input) { $Input.Trim() } else { "" }
+  
+  # Extraire shortLink si URL
+  $candidate = $raw
+  if ($candidate -match '^https?://.*?/b/([^/]+)') {
+    $candidate = $Matches[1]
+  }
+  
+  # Si vide -> proposer un choix parmi TOUS les boards
+  if ([string]::IsNullOrWhiteSpace($candidate)) {
+    Write-Host "`n📋 Récupération de vos boards disponibles..." -ForegroundColor Cyan
+    $allBoards = Invoke-TrelloGet "$script:Base/members/me/boards?fields=id,name,shortLink,url"
+    
+    if (-not $allBoards -or $allBoards.Count -eq 0) {
+      throw "❌ Aucun board accessible avec ce token."
+    }
+    
+    Write-Host "`nBoards accessibles :" -ForegroundColor Yellow
+    $i = 1
+    foreach ($b in $allBoards) {
+      Write-Host ("[{0}] {1}" -f $i, $b.name) -ForegroundColor White
+      Write-Host ("    ShortLink: {0}" -f $b.shortLink) -ForegroundColor Gray
+      Write-Host ("    URL: {0}" -f $b.url) -ForegroundColor Gray
+      $i++
+    }
+    
+    $idx = Read-Host "`nTapez le numéro du board (1-$($allBoards.Count))"
+    if ($idx -match '^\d+$') {
+      $sel = [int]$idx
+      if ($sel -ge 1 -and $sel -le $allBoards.Count) {
+        return $allBoards[$sel - 1]
+      }
+    }
+    throw "❌ Sélection invalide."
+  }
+  
+  # Tentative directe avec le shortLink ou ID
+  try {
+    return Invoke-TrelloGet "$script:Base/boards/$candidate?fields=id,name,shortLink,url"
+  } catch {
+    # Chercher par nom exact ou shortLink
+    $allBoards = Invoke-TrelloGet "$script:Base/members/me/boards?fields=id,name,shortLink,url"
+    $hit = $allBoards | Where-Object { $_.shortLink -eq $candidate -or $_.name -eq $raw } | Select-Object -First 1
+    
+    if ($hit) {
+      return $hit
+    }
+    
+    Write-Host "`n⚠️  Board '$raw' introuvable." -ForegroundColor Yellow
+    Write-Host "Boards accessibles :" -ForegroundColor Yellow
+    $i = 1
+    foreach ($b in $allBoards) {
+      Write-Host ("[{0}] {1}  (shortLink={2})" -f $i, $b.name, $b.shortLink)
+      $i++
+    }
+    throw "❌ Utilisez un shortLink listé ou le nom exact."
+  }
+}
+
+# ============================================================================
+# FONCTIONS DE GESTION DES LISTES
+# ============================================================================
+
+function New-TrelloList {
+  param(
+    [string]$BoardId,
+    [string]$Name,
+    [string]$Position = "bottom"
+  )
+  
+  Write-Host "🎯 Création de la liste '$Name'..." -ForegroundColor Cyan
+  try {
+    $list = Invoke-TrelloPost -Uri "$script:Base/lists" -Body @{
+      name = $Name
+      idBoard = $BoardId
+      pos = $Position
+    }
+    Write-Host "✅ Liste créée avec succès : $Name" -ForegroundColor Green
+    return $list
+  } catch {
+    Write-Warning "Impossible de créer la liste : $_"
+    return $null
+  }
+}
+
+function Create-DefaultLists {
+  param([string]$BoardId)
+  
+  Write-Host "`n🏗️ Création des listes par défaut..." -ForegroundColor Cyan
+  Write-Host "Voulez-vous créer des listes par défaut ? (O/n)" -ForegroundColor Yellow
+  Write-Host "  Listes proposées : 📥 Inbox, 🔄 In Progress, ✅ Done" -ForegroundColor Gray
+  
+  $createDefault = Read-Host
+  
+  if ($createDefault -eq "" -or $createDefault -eq "O" -or $createDefault -eq "o") {
+    $defaultLists = @(
+      @{ name = "📥 Inbox"; pos = "bottom" }
+      @{ name = "🔄 In Progress"; pos = "bottom" }
+      @{ name = "✅ Done"; pos = "bottom" }
+    )
+    
+    $created = @()
+    foreach ($listDef in $defaultLists) {
+      $list = New-TrelloList -BoardId $BoardId -Name $listDef.name -Position $listDef.pos
+      if ($list) {
+        $created += $list
+      }
+      Start-Sleep -Milliseconds 300
+    }
+    
+    if ($created.Count -gt 0) {
+      Write-Host "`n✅ $($created.Count) liste(s) créée(s) avec succès !" -ForegroundColor Green
+      return $created
     }
   } else {
-    Write-Host "Aucune configuration du board trouvée pour $BoardUrl" -ForegroundColor Yellow
+    Write-Host "Création personnalisée des listes..." -ForegroundColor Cyan
+    $lists = @()
+    do {
+      $listName = Read-Host "`nNom de la liste (ou laissez vide pour terminer)"
+      if (-not [string]::IsNullOrWhiteSpace($listName)) {
+        $list = New-TrelloList -BoardId $BoardId -Name $listName
+        if ($list) {
+          $lists += $list
+        }
+        Start-Sleep -Milliseconds 300
+      }
+    } while (-not [string]::IsNullOrWhiteSpace($listName))
+    
+    return $lists
   }
-  return $null
-}
-
-function Save-BoardConfig {
-  param([string]$BoardUrl, [string]$ListName, [string]$LabelName, [string]$LabelColor)
-  $config = @{
-    ListName = $ListName
-    LabelName = $LabelName
-    LabelColor = $LabelColor
-  }
-  $config | ConvertTo-Json | Set-Content (Join-Path $ScriptDir "board-config-$BoardUrl.json") -Encoding UTF8
-  Write-Host "✅ Configuration du board sauvegardée localement : $BoardUrl" -ForegroundColor Green
-}
-
-Write-Host "=== CONFIGURATION TRELLO ===" -ForegroundColor Cyan
-Write-Host "Pour obtenir votre KEY et TOKEN, allez sur : https://trello.com/app-key" -ForegroundColor Yellow
-
-# Charger la configuration existante
-$savedConfig = Load-TrelloConfig
-$Key = $null
-$Token = $null
-
-if ($savedConfig -and $savedConfig.Key -and $savedConfig.Token) {
-  Write-Host "Configuration trouvée du $($savedConfig.LastUpdated)" -ForegroundColor Green
-  Write-Host "Options :" -ForegroundColor Cyan
-  Write-Host "  [O] Utiliser les identifiants sauvegardés" -ForegroundColor White
-  Write-Host "  [N] Saisir de nouveaux identifiants" -ForegroundColor White
-  Write-Host "  [M] Modifier la configuration existante" -ForegroundColor White
   
-  $choice = Read-Host "Votre choix (O/n/m)"
+  return @()
+}
+
+function Create-KanbanPreset {
+  param([string]$BoardId)
   
-  if ($choice -eq "" -or $choice -eq "O" -or $choice -eq "o") {
-    $Key = $savedConfig.Key
-    $Token = $savedConfig.Token
-    Write-Host "✅ Utilisation des identifiants sauvegardés" -ForegroundColor Green
-  } elseif ($choice -eq "M" -or $choice -eq "m") {
-    Write-Host "Modification de la configuration..." -ForegroundColor Yellow
-    $Key = Read-Host "Nouvelle Trello API KEY"
-    $Token = Read-Host "Nouveau Trello TOKEN"
-    $BoardUrl = Read-Host "URL du board Trello (ex: https://trello.com/b/XXXXX)"
-    Save-TrelloConfig -Key $Key -Token $Token -BoardUrl $BoardUrl
+  Write-Host "`n📋 CRÉATION D'UN TABLEAU KANBAN COMPLET" -ForegroundColor Cyan
+  Write-Host "Ce preset va créer un tableau Kanban standard avec :" -ForegroundColor Yellow
+  Write-Host "  • 📥 Backlog - Toutes les idées et tâches futures" -ForegroundColor Gray
+  Write-Host "  • 📝 To Do - Tâches prêtes à être commencées" -ForegroundColor Gray
+  Write-Host "  • 🔄 In Progress - Travail en cours" -ForegroundColor Gray
+  Write-Host "  • 🔎 Testing - En attente de validation" -ForegroundColor Gray
+  Write-Host "  • ✅ Done - Tâches terminées" -ForegroundColor Gray
+  
+  $confirm = Read-Host "`nCréer ce tableau Kanban ? (O/n)"
+  
+  if ($confirm -ne "" -and $confirm -ne "O" -and $confirm -ne "o") {
+    Write-Host "❌ Création annulée" -ForegroundColor Yellow
+    return @()
   }
-  # Si choix "N", on continue vers la saisie des identifiants
-} else {
-  Write-Host "Aucune configuration sauvegardée trouvée." -ForegroundColor Yellow
-}
-
-# Si pas de configuration sauvegardée ou refusée, demander les identifiants
-if (-not $Key -or -not $Token) {
-  $Key = Read-Host "Trello API KEY (laisser vide pour utiliser `$env:TRELLO_KEY)"
-  if ([string]::IsNullOrWhiteSpace($Key)) { $Key = $env:TRELLO_KEY }
-  if ([string]::IsNullOrWhiteSpace($Key)) { throw "Aucune KEY fournie." }
-
-  $Token = Read-Host "Trello TOKEN (laisser vide pour utiliser `$env:TRELLO_TOKEN)"
-  if ([string]::IsNullOrWhiteSpace($Token)) { $Token = $env:TRELLO_TOKEN }
-  if ([string]::IsNullOrWhiteSpace($Token)) { throw "Aucun TOKEN fourni." }
-
-  # Sauvegarder les nouveaux identifiants
-  $saveConfig = Read-Host "Sauvegarder ces identifiants pour la prochaine fois ? (O/n)"
-  if ($saveConfig -eq "" -or $saveConfig -eq "O" -or $saveConfig -eq "o") {
-    $BoardUrl = Read-Host "URL du board Trello (ex: https://trello.com/b/XXXXX)"
-    Save-TrelloConfig -Key $Key -Token $Token -BoardUrl $BoardUrl
+  
+  Write-Host "`n🚀 Création du tableau Kanban..." -ForegroundColor Cyan
+  
+  $kanbanLists = @(
+    @{ name = "📥 Backlog"; pos = "bottom" }
+    @{ name = "📝 To Do"; pos = "bottom" }
+    @{ name = "🔄 In Progress"; pos = "bottom" }
+    @{ name = "🔎 Testing"; pos = "bottom" }
+    @{ name = "✅ Done"; pos = "bottom" }
+  )
+  
+  $created = @()
+  foreach ($listDef in $kanbanLists) {
+    $list = New-TrelloList -BoardId $BoardId -Name $listDef.name -Position $listDef.pos
+    if ($list) {
+      $created += $list
+    }
+    Start-Sleep -Milliseconds 300
   }
-}
-
-# Board : URL ou shortLink (après /b/)
-if ($savedConfig -and $savedConfig.BoardUrl) {
-  Write-Host "Board sauvegardé : $($savedConfig.BoardUrl)" -ForegroundColor Green
-  $useSavedBoard = Read-Host "Utiliser ce board ? (O/n)"
-  if ($useSavedBoard -eq "" -or $useSavedBoard -eq "O" -or $useSavedBoard -eq "o") {
-    $BoardInput = $savedConfig.BoardUrl
-  } else {
-    $BoardInput = Read-Host "URL du board Trello (ou juste le shortLink après /b/)"
+  
+  if ($created.Count -gt 0) {
+    Write-Host "`n✅ Tableau Kanban créé avec succès !" -ForegroundColor Green
+    Write-Host "   $($created.Count) listes créées" -ForegroundColor Gray
+    return $created
   }
-} else {
-  $BoardInput = Read-Host "URL du board Trello (ou juste le shortLink après /b/)"
+  
+  return @()
 }
 
-if ($BoardInput -match 'trello\.com/b/([^/]+)') { 
-  $BoardId = $Matches[1] 
-  $BoardUrl = $BoardInput
-} else { 
-  $BoardId = $BoardInput.Trim() 
-  $BoardUrl = "https://trello.com/b/$BoardId"
-}
-if ([string]::IsNullOrWhiteSpace($BoardId)) { throw "BoardId manquant." }
-
-# -------------------- Helpers --------------------
-function Join-QueryString {
-  param([hashtable]$Params)
-  ($Params.GetEnumerator() | ForEach-Object {
-    [System.Uri]::EscapeDataString($_.Key) + "=" + [System.Uri]::EscapeDataString([string]$_.Value)
-  }) -join "&"
-}
 
 function Select-ListFromBoard {
-  param([string]$BoardId)
+  param(
+    [string]$BoardId,
+    [bool]$AllowCreate = $true
+  )
+  
   Write-Host "`n📋 Récupération des listes disponibles..." -ForegroundColor Cyan
   try {
-    $baseUrl = "https://api.trello.com/1/boards/$BoardId/lists"
-    $queryParams = "fields=name,id,pos"
-    $fullUrl = "$baseUrl`?$queryParams"
-    $lists = Invoke-Trello $fullUrl
-    if ($lists.Count -eq 0) {
-      Write-Host "Aucune liste trouvée sur ce board" -ForegroundColor Yellow
-      return $null
+    $lists = Invoke-TrelloGet "$script:Base/boards/$BoardId/lists?fields=name,id,pos"
+    
+    # Si aucune liste
+    if (-not $lists -or $lists.Count -eq 0) {
+      Write-Host "⚠️  Aucune liste trouvée sur ce board" -ForegroundColor Yellow
+      
+      if ($AllowCreate) {
+        Write-Host "`n💡 Ce board est vide. Que voulez-vous faire ?" -ForegroundColor Cyan
+        Write-Host "  [1] Créer un tableau Kanban complet (Backlog, To Do, In Progress, Testing, Done)" -ForegroundColor White
+        Write-Host "  [2] Créer des listes simples (Inbox, In Progress, Done)" -ForegroundColor White
+        Write-Host "  [3] Créer mes propres listes" -ForegroundColor White
+        Write-Host "  [4] Annuler" -ForegroundColor White
+        
+        $choice = Read-Host "`nVotre choix (1-4)"
+        
+        if ($choice -eq "1") {
+          # Preset Kanban
+          $newLists = Create-KanbanPreset -BoardId $BoardId
+          if ($newLists.Count -gt 0) {
+            $lists = Invoke-TrelloGet "$script:Base/boards/$BoardId/lists?fields=name,id,pos"
+            Write-Host "`n✅ Listes Kanban créées et rechargées" -ForegroundColor Green
+          } else {
+            Write-Host "❌ Aucune liste n'a été créée" -ForegroundColor Red
+            return $null
+          }
+        } elseif ($choice -eq "2") {
+          # Listes simples
+          $newLists = Create-DefaultLists -BoardId $BoardId
+          if ($newLists.Count -gt 0) {
+            $lists = Invoke-TrelloGet "$script:Base/boards/$BoardId/lists?fields=name,id,pos"
+            Write-Host "`n✅ Listes créées et rechargées" -ForegroundColor Green
+          } else {
+            Write-Host "❌ Aucune liste n'a été créée" -ForegroundColor Red
+            return $null
+          }
+        } elseif ($choice -eq "3") {
+          # Listes personnalisées
+          Write-Host "Création personnalisée des listes..." -ForegroundColor Cyan
+          $customLists = @()
+          do {
+            $listName = Read-Host "`nNom de la liste (ou laissez vide pour terminer)"
+            if (-not [string]::IsNullOrWhiteSpace($listName)) {
+              $list = New-TrelloList -BoardId $BoardId -Name $listName
+              if ($list) {
+                $customLists += $list
+              }
+              Start-Sleep -Milliseconds 300
+            }
+          } while (-not [string]::IsNullOrWhiteSpace($listName))
+          
+          if ($customLists.Count -gt 0) {
+            $lists = Invoke-TrelloGet "$script:Base/boards/$BoardId/lists?fields=name,id,pos"
+            Write-Host "`n✅ $($customLists.Count) liste(s) créée(s)" -ForegroundColor Green
+          } else {
+            Write-Host "❌ Aucune liste n'a été créée" -ForegroundColor Red
+            return $null
+          }
+        } else {
+          Write-Host "❌ Impossible de continuer sans liste" -ForegroundColor Red
+          return $null
+        }
+      } else {
+        return $null
+      }
     }
     
+    # Afficher les listes
     Write-Host "`nListes disponibles sur le board :" -ForegroundColor Cyan
-    for ($i = 0; $i -lt $lists.Count; $i++) {
-      $list = $lists[$i]
-      Write-Host ("[{0}] {1}" -f ($i + 1), $list.name) -ForegroundColor White
+    if ($AllowCreate) {
+      Write-Host "[0] 🆕 Créer une nouvelle liste" -ForegroundColor White
     }
     
-    $choice = Read-Host "`nSélectionnez le numéro de la liste (1-$($lists.Count))"
-    $index = [int]$choice - 1
+    $i = 1
+    foreach ($list in $lists) {
+      Write-Host ("[{0}] {1}" -f $i, $list.name) -ForegroundColor White
+      $i++
+    }
     
+    $maxChoice = $lists.Count
+    $minChoice = if ($AllowCreate) { 0 } else { 1 }
+    $choice = Read-Host "`nSélectionnez le numéro de la liste ($minChoice-$maxChoice)"
+    $index = [int]$choice
+    
+    # Option : Créer une nouvelle liste
+    if ($index -eq 0 -and $AllowCreate) {
+      $newListName = Read-Host "Nom de la nouvelle liste"
+      if (-not [string]::IsNullOrWhiteSpace($newListName)) {
+        $newList = New-TrelloList -BoardId $BoardId -Name $newListName
+        if ($newList) {
+          Write-Host "✅ Liste créée et sélectionnée : $($newList.name)" -ForegroundColor Green
+          return $newList
+        } else {
+          Write-Warning "Échec de la création. Sélection d'une liste existante..."
+          return Select-ListFromBoard -BoardId $BoardId -AllowCreate $false
+        }
+      } else {
+        Write-Warning "Nom de liste vide. Sélection d'une liste existante..."
+        return Select-ListFromBoard -BoardId $BoardId -AllowCreate $false
+      }
+    }
+    
+    # Sélection d'une liste existante
+    $index = $index - 1
     if ($index -ge 0 -and $index -lt $lists.Count) {
       $selectedList = $lists[$index]
-      Write-Host ("✅ Liste sélectionnée : {0}" -f $selectedList.name) -ForegroundColor Green
+      Write-Host "✅ Liste sélectionnée : $($selectedList.name)" -ForegroundColor Green
       return $selectedList
     } else {
       throw "Sélection invalide"
     }
+    
   } catch {
-    Write-Warning "Erreur lors de la récupération des listes : $($_.Exception.Message)"
+    Write-Warning "Erreur lors de la récupération des listes : $_"
+    return $null
+  }
+}
+
+# ============================================================================
+# FONCTIONS DE GESTION DES LABELS
+# ============================================================================
+
+function Get-BoardLabels {
+  param([string]$BoardId)
+  Invoke-TrelloGet "$script:Base/boards/$BoardId/labels?fields=name,color&limit=1000"
+}
+
+function Ensure-Label {
+  param(
+    [string]$BoardId,
+    [ref]$ExistingLabels,
+    [string]$Name,
+    [string]$Color
+  )
+  
+  $labels = $ExistingLabels.Value
+  
+  # Chercher label existant par nom
+  $hit = $labels | Where-Object { $_.name -and ($_.name -ieq $Name) } | Select-Object -First 1
+  if ($hit) {
+    Write-Host "  ✅ Label existant trouvé : '$Name'" -ForegroundColor Green
+    return $hit.id
+  }
+  
+  # Créer le label
+  Write-Host "  🎯 Création du label : '$Name' (couleur: $Color)" -ForegroundColor Cyan
+  try {
+    $newLabel = Invoke-TrelloPost -Uri "$script:Base/labels" -Body @{
+      name = $Name
+      color = $Color
+      idBoard = $BoardId
+    }
+    
+    Write-Host "  ✅ Label créé avec succès (ID: $($newLabel.id))" -ForegroundColor Green
+    
+    # Ajouter à la liste des labels existants
+    $ExistingLabels.Value = @($labels) + @($newLabel)
+    return $newLabel.id
+  } catch {
+    Write-Warning "  ⚠️ Impossible de créer le label : $_"
     return $null
   }
 }
 
 function Select-LabelFromBoard {
   param([string]$BoardId)
+  
   Write-Host "`n🏷️ Récupération des labels disponibles..." -ForegroundColor Cyan
-  try {
-    $baseUrl = "https://api.trello.com/1/boards/$BoardId/labels"
-    $limit = "limit=1000"
-    $fields = "fields=id,name,color"
-    $queryParams = "$limit" + "&" + "$fields"
-    $fullUrl = "$baseUrl`?$queryParams"
-    $labels = Invoke-Trello $fullUrl
-    if ($labels.Count -eq 0) {
-      Write-Host "Aucun label trouvé sur ce board" -ForegroundColor Yellow
-      return $null
-    }
+  $labels = Get-BoardLabels -BoardId $BoardId
+  
+  if ($labels) {
+    Write-Host "✅ $($labels.Count) label(s) trouvé(s) sur le board" -ForegroundColor Green
+  } else {
+    Write-Host "✅ 0 label(s) trouvé(s) sur le board" -ForegroundColor Yellow
+    $labels = @()
+  }
+  
+  Write-Host "`nLabels disponibles sur le board :" -ForegroundColor Cyan
+  Write-Host "[0] Créer un nouveau label" -ForegroundColor White
+  
+  $i = 1
+  foreach ($label in $labels) {
+    $labelName = if ($label.name) { $label.name } else { "Sans nom" }
+    Write-Host ("[{0}] {1} (couleur: {2})" -f $i, $labelName, $label.color) -ForegroundColor White
+    $i++
+  }
+  
+  $choice = Read-Host "`nSélectionnez le numéro du label (0-$($labels.Count))"
+  $index = [int]$choice
+  
+  # Option : Créer un nouveau label
+  if ($index -eq 0) {
+    Write-Host "✅ Création d'un nouveau label" -ForegroundColor Green
+    $labelName = Read-Host "Nom du nouveau label"
+    Write-Host "Couleurs disponibles : yellow, purple, blue, red, green, orange, black, sky, pink, lime, null" -ForegroundColor Gray
+    $labelColor = Read-Host "Couleur du label"
     
-    Write-Host "`nLabels disponibles sur le board :" -ForegroundColor Cyan
-    Write-Host "[0] Aucun label" -ForegroundColor White
-    for ($i = 0; $i -lt $labels.Count; $i++) {
-      $label = $labels[$i]
-      $name = if ($label.name) { "'$($label.name)'" } else { "Sans nom" }
-      $color = if ($label.color) { $label.color } else { "Aucune" }
-      Write-Host ("[{0}] {1} (couleur: {2})" -f ($i + 1), $name, $color) -ForegroundColor White
-    }
+    Write-Host "`n🎯 Gestion du label : '$labelName' (couleur: $labelColor)" -ForegroundColor Cyan
+    $labelId = Ensure-Label -BoardId $BoardId -ExistingLabels ([ref]$labels) -Name $labelName -Color $labelColor
     
-    $choice = Read-Host "`nSélectionnez le numéro du label (0-$($labels.Count))"
-    $index = [int]$choice - 1
-    
-    if ($index -eq -1) {
-      Write-Host "✅ Aucun label sélectionné" -ForegroundColor Green
-      return $null
-    } elseif ($index -ge 0 -and $index -lt $labels.Count) {
-      $selectedLabel = $labels[$index]
-      Write-Host ("✅ Label sélectionné : {0} (couleur: {1})" -f $selectedLabel.name, $selectedLabel.color) -ForegroundColor Green
-      return $selectedLabel
+    if ($labelId) {
+      Write-Host "✅ Label prêt à être utilisé" -ForegroundColor Green
+      return @{ id = $labelId; name = $labelName; color = $labelColor }
     } else {
-      throw "Sélection invalide"
+      Write-Warning "Échec de la création du label"
+      return $null
     }
-  } catch {
-    Write-Warning "Erreur lors de la récupération des labels : $($_.Exception.Message)"
+  }
+  
+  # Sélection d'un label existant
+  $index = $index - 1
+  if ($index -ge 0 -and $index -lt $labels.Count) {
+    $selectedLabel = $labels[$index]
+    Write-Host "✅ Label sélectionné : $($selectedLabel.name)" -ForegroundColor Green
+    return $selectedLabel
+  } else {
+    Write-Warning "Sélection invalide"
     return $null
   }
 }
 
-function Invoke-Trello {
-  param(
-    [Parameter(Mandatory)][string]$Uri,
-    [ValidateSet('GET','POST','PUT','DELETE')][string]$Method='GET',
-    [hashtable]$Body
-  )
-  $p = @{}; $p.key = $Key; $p.token = $Token
-  if ($Body) { foreach($k in $Body.Keys){ $p[$k] = $Body[$k] } }
-
-  try {
-    if ($Method -eq 'GET') {
-      $qs = Join-QueryString $p
-      $sep = '?'; if ($Uri -match '\?') { $sep = '&' }
-      $full = "$Uri$sep$qs"
-      Write-Verbose "Appel GET: $full"
-      return Invoke-RestMethod -Method GET -Uri $full -ErrorAction Stop
-    } else {
-      Write-Verbose ("Appel {0}: {1}" -f $Method, $Uri)
-      return Invoke-RestMethod -Method $Method -Uri $Uri -Body $p -ErrorAction Stop
-    }
-  } catch {
-    # Affiche le détail JSON renvoyé par Trello si dispo
-    try {
-      if ($_.Exception.Response) {
-        $respStream = $_.Exception.Response.GetResponseStream()
-        $reader = New-Object System.IO.StreamReader($respStream)
-        $body = $reader.ReadToEnd()
-        Write-Warning "Réponse Trello: $body"
-      }
-    } catch {}
-    
-    $errorMsg = "Trello API error ($Method $Uri): $($_.Exception.Message)"
-    if ($_.Exception.Response) {
-      $errorMsg += " (HTTP $($_.Exception.Response.StatusCode))"
-    }
-    throw $errorMsg
-  }
-}
-
-function Get-OrCreate-ListId {
-  param([string]$BoardId,[string]$ListName)
-  $baseUrl = "https://api.trello.com/1/boards/$BoardId/lists"
-  $queryParams = "fields=name,id"
-  $fullUrl = "$baseUrl`?$queryParams"
-  $lists = Invoke-Trello $fullUrl
-  $id = ($lists | Where-Object { $_.name -eq $ListName }).id
-  if (-not $id) {
-    $created = Invoke-Trello -Method POST -Uri "https://api.trello.com/1/lists" -Body @{ name=$ListName; idBoard=$BoardId; pos="top" }
-    $id = $created.id
-  }
-  $id
-}
-
-function Get-OrCreate-LabelId {
-  param([string]$BoardId,[string]$Name,[string]$Color)
-
-  if ([string]::IsNullOrWhiteSpace($Name)) { return $null }
-  
-  # Nettoyer le nom du label
-  $Name = $Name.Trim()
-  if ([string]::IsNullOrWhiteSpace($Name)) { return $null }
-  
-  Write-Host "🎯 CRÉATION FORCÉE d'un nouveau label" -ForegroundColor Cyan
-  Write-Host "Nom demandé: '$Name'" -ForegroundColor White
-  Write-Host "Couleur demandée: '$Color'" -ForegroundColor White
-  
-  # Nettoyer le nom (juste enlever les retours à la ligne)
-  $CleanName = $Name -replace '[\r\n]', ' '
-  $CleanName = $CleanName.Trim()
-  
-  # Créer le label avec VOTRE nom et VOTRE couleur
-  try {
-    if ($Color -eq "null") {
-      # Sans couleur
-      $lab = Invoke-Trello -Method POST -Uri "https://api.trello.com/1/labels" -Body @{ 
-        name=$CleanName; 
-        idBoard=$BoardId 
-      }
-      Write-Host "✅ Label créé SANS couleur (ID: $($lab.id))" -ForegroundColor Green
-    } else {
-      # AVEC couleur
-      $lab = Invoke-Trello -Method POST -Uri "https://api.trello.com/1/labels" -Body @{ 
-        name=$CleanName; 
-        color=$Color; 
-        idBoard=$BoardId 
-      }
-      Write-Host "✅ Label créé AVEC couleur '$Color' (ID: $($lab.id))" -ForegroundColor Green
-    }
-    
-    Write-Host "  Nom dans Trello: '$($lab.name)'" -ForegroundColor Gray
-    Write-Host "  Couleur dans Trello: '$($lab.color)'" -ForegroundColor Gray
-    
-    return $lab.id
-    
-  } catch {
-    Write-Host "❌ ÉCHEC de la création du label" -ForegroundColor Red
-    Write-Host "Erreur: $($_.Exception.Message)" -ForegroundColor Red
-    
-    # Si l'API refuse, proposer des solutions
-    Write-Host "`n🔧 SOLUTIONS :" -ForegroundColor Cyan
-    Write-Host "1. Créer le label MANUELLEMENT sur le board" -ForegroundColor White
-    Write-Host "2. Utiliser un label existant" -ForegroundColor White
-    Write-Host "3. Continuer sans label" -ForegroundColor White
-    
-    $choice = Read-Host "`nVotre choix (1/2/3)"
-    
-    if ($choice -eq "1") {
-      Write-Host "`n📋 INSTRUCTIONS MANUELLES :" -ForegroundColor Cyan
-      Write-Host "1. Ouvrez votre board Trello dans le navigateur" -ForegroundColor White
-      Write-Host "2. Cliquez sur 'Afficher le menu' (3 points en haut à droite)" -ForegroundColor White
-      Write-Host "3. Sélectionnez 'Étiquettes'" -ForegroundColor White
-      Write-Host "4. Cliquez sur 'Créer une nouvelle étiquette'" -ForegroundColor White
-      Write-Host "5. Nom : '$CleanName'" -ForegroundColor White
-      Write-Host "6. Couleur : $Color" -ForegroundColor White
-      Write-Host "7. Cliquez sur 'Créer'" -ForegroundColor White
-      Write-Host "8. Relancez ce script après création" -ForegroundColor White
-      
-      Write-Host "`nAppuyez sur Entrée pour quitter..." -ForegroundColor Cyan
-      Read-Host
-      exit 0
-      
-    } elseif ($choice -eq "2") {
-      Write-Host "`nSélection d'un label existant..." -ForegroundColor Cyan
-      $baseUrl = "https://api.trello.com/1/boards/$BoardId/labels"
-      $limit = "limit=1000"
-      $fields = "fields=id,name,color"
-      $queryParams = "$limit" + "&" + "$fields"
-      $fullUrl = "$baseUrl`?$queryParams"
-      $labels = Invoke-Trello $fullUrl
-      $labels | ForEach-Object { 
-        $name = if ($_.name) { "'$($_.name)'" } else { "Sans nom" }
-        Write-Host "ID: $($_.id) | Nom: $name | Couleur: $($_.color)" -ForegroundColor White
-      }
-      
-      $selectedId = Read-Host "Entrez l'ID du label à utiliser"
-      $selectedLabel = $labels | Where-Object { $_.id -eq $selectedId } | Select-Object -First 1
-      
-      if ($selectedLabel) {
-        Write-Host "✅ Label sélectionné : $($selectedLabel.id)" -ForegroundColor Green
-        return $selectedLabel.id
-      } else {
-        throw "ID de label invalide"
-      }
-      
-    } else {
-      Write-Host "✅ Continuation sans label" -ForegroundColor Green
-      return $null
-    }
-  }
-}
+# ============================================================================
+# FONCTIONS DE CRÉATION DE CARTES
+# ============================================================================
 
 function New-TrelloCard {
-  param([string]$Title,[string]$Desc,[string]$ListId)
-  Invoke-Trello -Method POST -Uri "https://api.trello.com/1/cards" -Body @{ name=$Title; desc=$Desc; idList=$ListId }
+  param(
+    [string]$ListId,
+    [string]$Name,
+    [string]$Desc,
+    [string[]]$LabelIds
+  )
+  
+  $body = @{
+    name = $Name
+    desc = $Desc
+    idList = $ListId
+  }
+  
+  if ($LabelIds -and $LabelIds.Count -gt 0) {
+    $body.idLabels = ($LabelIds -join ",")
+  }
+  
+  Invoke-TrelloPost -Uri "$script:Base/cards" -Body $body
 }
 
-function Add-Checklist {
-  param([string]$CardId,[string]$ChecklistName,[string[]]$Items)
-  if (-not $Items -or $Items.Count -eq 0) { return }
-  $cl = Invoke-Trello -Method POST -Uri "https://api.trello.com/1/cards/$CardId/checklists" -Body @{ name=$ChecklistName }
-  foreach ($i in $Items) {
-    Invoke-Trello -Method POST -Uri "https://api.trello.com/1/checklists/$($cl.id)/checkItems" -Body @{ name=$i } | Out-Null
+function New-TrelloChecklist {
+  param(
+    [string]$CardId,
+    [string]$Name
+  )
+  
+  $escapedName = [uri]::EscapeDataString($Name)
+  $authQuery = "key=$script:Key&token=$script:Token"
+  Invoke-RestMethod -Uri "$script:Base/cards/$CardId/checklists?name=$escapedName&$authQuery" -Method Post
+}
+
+function Add-TrelloCheckItem {
+  param(
+    [string]$ChecklistId,
+    [string]$Name,
+    [bool]$Checked = $false
+  )
+  
+  $checkedStr = if ($Checked) { "true" } else { "false" }
+  
+  Invoke-TrelloPost -Uri "$script:Base/checklists/$ChecklistId/checkItems" -Body @{
+    name = $Name
+    pos = "bottom"
+    checked = $checkedStr
   }
 }
 
-function Add-LabelToCard {
-  param([string]$CardId,[string]$LabelId)
-  if ([string]::IsNullOrWhiteSpace($LabelId)) { return }
+function Create-CustomCard {
+  param(
+    [string]$ListId,
+    [string]$BoardId,
+    [ref]$ExistingLabels
+  )
+  
+  Write-Host "`n🎴 Création d'une carte personnalisée" -ForegroundColor Cyan
+  
+  # Nom de la carte
+  $cardName = Read-Host "Nom de la carte"
+  if ([string]::IsNullOrWhiteSpace($cardName)) {
+    Write-Warning "Nom vide, carte ignorée"
+    return $null
+  }
+  
+  # Description
+  Write-Host "Description de la carte (laissez vide pour ignorer) :" -ForegroundColor Gray
+  $cardDesc = Read-Host
+  
+  # Labels
+  Write-Host "`nVoulez-vous ajouter des labels à cette carte ? (O/n)" -ForegroundColor Yellow
+  $addLabels = Read-Host
+  $labelIds = @()
+  
+  if ($addLabels -eq "" -or $addLabels -eq "O" -or $addLabels -eq "o") {
+    do {
+      Write-Host "`nLabels existants :" -ForegroundColor Cyan
+      $labels = $ExistingLabels.Value
+      $i = 0
+      Write-Host "[$i] Terminer (ne plus ajouter de labels)" -ForegroundColor White
+      $i = 1
+      foreach ($lbl in $labels) {
+        $lblName = if ($lbl.name) { $lbl.name } else { "Sans nom" }
+        Write-Host "[$i] $lblName (couleur: $($lbl.color))" -ForegroundColor White
+        $i++
+      }
+      Write-Host "[$i] Créer un nouveau label" -ForegroundColor White
+      
+      $labelChoice = Read-Host "Sélectionnez un label (0-$i)"
+      $labelIdx = [int]$labelChoice
+      
+      if ($labelIdx -eq 0) {
+        break
+      } elseif ($labelIdx -eq $i) {
+        # Créer nouveau label
+        $newLabelName = Read-Host "Nom du nouveau label"
+        Write-Host "Couleurs : yellow, purple, blue, red, green, orange, black, sky, pink, lime, null" -ForegroundColor Gray
+        $newLabelColor = Read-Host "Couleur"
+        
+        $newLabelId = Ensure-Label -BoardId $BoardId -ExistingLabels $ExistingLabels -Name $newLabelName -Color $newLabelColor
+        if ($newLabelId) {
+          $labelIds += $newLabelId
+          Write-Host "✅ Label ajouté à la carte" -ForegroundColor Green
+        }
+      } elseif ($labelIdx -ge 1 -and $labelIdx -lt $i) {
+        $selectedLabel = $labels[$labelIdx - 1]
+        $labelIds += $selectedLabel.id
+        Write-Host "✅ Label '$($selectedLabel.name)' ajouté" -ForegroundColor Green
+      }
+      
+      $moreLabels = Read-Host "Ajouter un autre label ? (O/n)"
+    } while ($moreLabels -eq "" -or $moreLabels -eq "O" -or $moreLabels -eq "o")
+  }
+  
+  # Créer la carte
   try {
-    Invoke-Trello -Method POST -Uri "https://api.trello.com/1/cards/$CardId/idLabels" -Body @{ value=$LabelId } | Out-Null
-    Write-Host "  🏷️ Label appliqué à la carte" -ForegroundColor Green
+    $card = New-TrelloCard -ListId $ListId -Name $cardName -Desc $cardDesc -LabelIds $labelIds
+    Write-Host "✅ Carte '$cardName' créée avec succès" -ForegroundColor Green
+    
+    # Ajouter une checklist ?
+    Write-Host "`nVoulez-vous ajouter une checklist ? (O/n)" -ForegroundColor Yellow
+    $addChecklist = Read-Host
+    
+    if ($addChecklist -eq "" -or $addChecklist -eq "O" -or $addChecklist -eq "o") {
+      $checklistName = Read-Host "Nom de la checklist (défaut: Tâches)"
+      if ([string]::IsNullOrWhiteSpace($checklistName)) {
+        $checklistName = "Tâches"
+      }
+      
+      $checklist = New-TrelloChecklist -CardId $card.id -Name $checklistName
+      Write-Host "📋 Checklist '$checklistName' créée" -ForegroundColor Gray
+      
+      Write-Host "Ajoutez des tâches (laissez vide pour terminer) :" -ForegroundColor Gray
+      $taskCount = 0
+      do {
+        $taskName = Read-Host "Tâche"
+        if (-not [string]::IsNullOrWhiteSpace($taskName)) {
+          Add-TrelloCheckItem -ChecklistId $checklist.id -Name $taskName | Out-Null
+          $taskCount++
+        }
+      } while (-not [string]::IsNullOrWhiteSpace($taskName))
+      
+      if ($taskCount -gt 0) {
+        Write-Host "✅ $taskCount tâche(s) ajoutée(s)" -ForegroundColor Green
+      }
+    }
+    
+    return $card
   } catch {
-    Write-Warning "  ⚠️ Impossible d'appliquer le label: $($_.Exception.Message)"
+    Write-Host "❌ Erreur lors de la création : $_" -ForegroundColor Red
+    return $null
   }
 }
 
-# Liste cible
-$savedBoardConfig = Load-BoardConfig -BoardUrl $BoardUrl
-if ($savedBoardConfig -and $savedBoardConfig.ListName) {
-  Write-Host "Liste sauvegardée : $($savedBoardConfig.ListName)" -ForegroundColor Green
-  $useSavedList = Read-Host "Utiliser cette liste ? (O/n)"
-  if ($useSavedList -eq "" -or $useSavedList -eq "O" -or $useSavedList -eq "o") {
-    $selectedList = @{ name = $savedBoardConfig.ListName; id = $null }
-  } else {
-    $selectedList = Select-ListFromBoard -BoardId $BoardId
-  }
-} else {
-  $selectedList = Select-ListFromBoard -BoardId $BoardId
-}
+# ============================================================================
+# SPÉCIFICATIONS DES CARTES PAR DÉFAUT
+# ============================================================================
 
-if (-not $selectedList) { throw "Aucune liste sélectionnée." }
-$TargetListName = $selectedList.name
+$CardsSpec = @(
+  [PSCustomObject]@{
+    Name = "KPI par rôle"
+    Desc = @"
+Créer des KPIs spécifiques pour chaque rôle dans le dashboard.
 
-# Label (nom + couleur via menu)
-if ($savedBoardConfig -and $savedBoardConfig.LabelName) {
-  Write-Host "Label sauvegardé : $($savedBoardConfig.LabelName) (couleur: $($savedBoardConfig.LabelColor))" -ForegroundColor Green
-  $useSavedLabel = Read-Host "Utiliser ce label ? (O/n)"
-  if ($useSavedLabel -eq "" -or $useSavedLabel -eq "O" -or $useSavedLabel -eq "o") {
-    $selectedLabel = @{ name = $savedBoardConfig.LabelName; color = $savedBoardConfig.LabelColor; id = $null }
-  } else {
-    $selectedLabel = Select-LabelFromBoard -BoardId $BoardId
-  }
-} else {
-  $selectedLabel = Select-LabelFromBoard -BoardId $BoardId
-}
+# Rôles à couvrir
+- Administrateur
+- Manager
+- Utilisateur standard
+- Client externe
 
-$LabelName = $null
-$LabelColor = $null
-if ($selectedLabel) {
-  $LabelName = $selectedLabel.name
-  $LabelColor = $selectedLabel.color
-}
-
-$SleepBetween = 0.35
-$ChecklistName = "DoD"
-
-# -------------------- ZONE À MODIFIER : tes cartes --------------------
-$Cards = @(
-  @{
-    title = "KPI par rôle (User/Tech/Manager/RH/Admin)"
-    desc  = @"
-Cette carte définit les indicateurs affichés sur le dashboard en fonction du rôle. Pour l'Utilisateur : tickets ouverts, derniers documents, notifications non lues. Pour le Technicien : tickets assignés/en retard, MTTR/âge moyen, équipements en panne. Pour le Manager : charge par technicien, SLA tenus, tendances mensuelles. Pour la RH : nouveaux comptes, comptes inactifs, événements/planning. Pour l'Admin : sessions actives, erreurs système, licences proches d'expiration. Chaque KPI précise la définition, la source de données, la période (jour/semaine/mois) et le mode d'actualisation afin de garantir une lecture fiable et comparable.
+# Métriques par rôle
+Définir les métriques pertinentes pour chaque profil.
 "@
-    dod   = @(
-      "Liste des KPI par rôle rédigée avec définition, formule et période (doc /docs/dashboard/kpi-par-role.md).",
-      "Source de données et requêtes identifiées pour chaque KPI (tables, vues, agrégations).",
-      "Seuils/états (OK/attention/critique) documentés, avec légende cohérente.",
-      "Cas 'données vides' et 'erreur de chargement' prévus avec messages clairs.",
-      "Budget perf noté (latence cible p95) et respecté sur dataset d'essai.",
-      "Validation PO/Stakeholders (par rôle) consignée avec exemples d'écran."
+    Tasks = @(
+      "Identifier les rôles dans l'application",
+      "Définir les KPIs pour chaque rôle",
+      "Créer les requêtes de données nécessaires",
+      "Implémenter l'affichage conditionnel selon le rôle",
+      "Tester l'affichage pour chaque profil"
     )
   },
-  @{
-    title = "Graphes (tendances, répartitions)"
-    desc  = @"
-Cette carte spécifie les visualisations principales du dashboard : courbes de tendance (tickets créés/résolus, activité login), barres empilées (répartition par priorité, par site/région), camemberts/donut pour la part de catégories, et cartes thermiques simples si nécessaire. Les axes, légendes, unités, périodes de comparaison (N vs N-1) et règles d'accessibilité (contraste, alternative textuelle) sont définis. Le style visuel respecte les tokens glassmorphism sans nuire à la lisibilité.
+  
+  [PSCustomObject]@{
+    Name = "Graphes"
+    Desc = @"
+Intégrer des graphiques interactifs dans le dashboard.
+
+# Types de graphiques
+- Courbes d'évolution
+- Histogrammes
+- Camemberts
+- Cartes de chaleur
+
+# Bibliothèque : Chart.js ou Recharts
 "@
-    dod   = @(
-      "Catalogue de graphes défini (type, métrique, période, axes, légendes) dans /docs/dashboard/graphs-spec.md.",
-      "États de chargement/vide/erreur modélisés pour chaque graphique.",
-      "Règles d'accessibilité documentées (contraste, descriptions textuelles).",
-      "Exemples comparatifs N vs N-1 ou rolling window précisés.",
-      "Tests de performance (temps de rendu) et limites de points par graph fixés.",
-      "Validation UX/PO sur lisibilité et cohérence visuelle."
+    Tasks = @(
+      "Choisir la bibliothèque de graphiques",
+      "Installer les dépendances",
+      "Créer les composants de base",
+      "Implémenter la récupération de données",
+      "Ajouter l'interactivité",
+      "Optimiser les performances"
     )
   },
-  @{
-    title = "Alertes (urgences, expirations, incidents)"
-    desc  = @"
-Cette carte décrit les alertes à remonter sur le dashboard : tickets urgents (P0/P1) non pris en charge, licences arrivant à expiration, équipements/agents offline au-delà du seuil, erreurs système récentes. Chaque alerte précise son déclencheur, sa priorité, son destinataire potentiel et sa durée de visibilité. Les messages doivent être concis, actionnables (liens vers la vue concernée) et respecter le périmètre de droits, pour éviter toute divulgation d'informations sensibles.
+  
+  [PSCustomObject]@{
+    Name = "Alertes"
+    Desc = @"
+Système d'alertes pour notifier les événements importants.
+
+# Types d'alertes
+- Alertes critiques (rouge)
+- Avertissements (orange)
+- Informations (bleu)
+- Succès (vert)
+
+# Canaux de notification
+Email, Push, In-app
 "@
-    dod   = @(
-      "Table de règles d'alertes rédigée (déclencheur, seuil, priorité, destinataires) /docs/dashboard/alerts.md.",
-      "Affichage des alertes contextualisé par rôle et périmètre (RBAC respecté).",
-      "Lien d'action direct depuis l'alerte (ex.: ouvrir ticket, page licence).",
-      "Gestion d'acknowledgement/masquage temporaire documentée si applicable.",
-      "Jeu d'essai couvrant urgences, expirations et incidents simulés.",
-      "Validation Sec/PO (pas d'exposition d'infos hors périmètre)."
-    )
-  },
-  @{
-    title = "Quick actions (contextuelles)"
-    desc  = @"
-Cette carte définit la zone d'actions rapides du dashboard, adaptée au rôle et au contexte. Exemples : l'Utilisateur crée un ticket, le Technicien ouvre sa file et planifie une intervention, le Manager génère un rapport d'équipe, la RH ajoute un document/planning, l'Admin lance une sauvegarde ou accède à la configuration. Les actions doivent être claires, limitées en nombre, protégées par confirmation quand c'est sensible, et toujours conformes aux permissions effectives.
-"@
-    dod   = @(
-      "Matrice des quick actions par rôle documentée (/docs/dashboard/quick-actions.md) avec icônes et libellés.",
-      "Règles de garde-fous (confirmations, restrictions) notées pour actions sensibles.",
-      "Indisponibles non affichées (pas de bouton grisé pour actions interdites).",
-      "Parcours post-action (feedback/toast, redirection) défini et cohérent.",
-      "Tests E2E de présence/absence par rôle et vérification d'accès côté serveur.",
-      "Validation UX/PO (clarté, nombre raisonnable d'actions)."
-    )
-  },
-  @{
-    title = "Timeline activités récentes"
-    desc  = @"
-Cette carte spécifie la timeline d'activités affichée sur le dashboard : connexions récentes, créations/éditions de tickets, attributions d'équipements, changements de licences (Admin), documents ajoutés, notifications envoyées. Les événements affichés respectent le périmètre et la visibilité par rôle. La timeline prévoit des filtres de base (type, période), une pagination/chargement progressif et des libellés compréhensibles, avec liens vers les éléments d'origine.
-"@
-    dod   = @(
-      "Schéma des événements et formatage des messages défini (/docs/dashboard/timeline-spec.md).",
-      "Filtres de base (type/période) + pagination/chargement progressif spécifiés.",
-      "RBAC appliqué: aucun événement hors périmètre affiché.",
-      "États vide/erreur définis avec messages standards.",
-      "Exemples rédigés pour chaque type d'événement avec liens de navigation.",
-      "Validation PO/Tech sur pertinence et densité d'information."
+    Tasks = @(
+      "Définir les règles d'alertes",
+      "Créer le système de notification",
+      "Implémenter l'interface utilisateur",
+      "Configurer les canaux (email, push)",
+      "Ajouter la gestion des préférences",
+      "Tester les différents scénarios"
     )
   }
 )
 
-# -------------------- Exécution --------------------
-Write-Host "`n=== VÉRIFICATION DE L'AUTHENTIFICATION ===" -ForegroundColor Cyan
-Write-Host "KEY: $($Key.Substring(0,8) + '...')" -ForegroundColor Gray
-Write-Host "TOKEN: $($Token.Substring(0,8) + '...')" -ForegroundColor Gray
+# ============================================================================
+# SCRIPT PRINCIPAL
+# ============================================================================
 
 try {
-  Write-Host "`nVérification du compte…" -ForegroundColor Cyan
-  $me = Invoke-Trello "https://api.trello.com/1/members/me"
-  Write-Host ("✅ Connecté : {0} (@{1})" -f $me.fullName, $me.username) -ForegroundColor Green
+  Write-Host @"
   
-  Write-Host "`n=== CRÉATION DES RESSOURCES ===" -ForegroundColor Cyan
+╔═══════════════════════════════════════════════════════════════╗
+║                        AUTOTRELLO                             ║
+║          Création automatique de cartes Trello                ║
+╚═══════════════════════════════════════════════════════════════╝
+
+"@ -ForegroundColor Cyan
+
+  # Configuration
+  Get-TrelloConfig
   
-  # Utiliser l'ID de liste déjà récupéré ou le récupérer
-  if ($selectedList.id) {
-    $listId = $selectedList.id
-    Write-Host ("✅ Liste: {0} ({1}) - ID récupéré" -f $TargetListName, $listId) -ForegroundColor Green
-  } else {
-    $listId = Get-OrCreate-ListId -BoardId $BoardId -ListName $TargetListName
-    Write-Host ("✅ Liste: {0} ({1}) - ID créé/récupéré" -f $TargetListName, $listId) -ForegroundColor Green
+  # Vérification de l'authentification
+  Write-Host "`n=== VÉRIFICATION DE L'AUTHENTIFICATION ===" -ForegroundColor Cyan
+  Write-Host "KEY: $($script:Key.Substring(0,10))..." -ForegroundColor Gray
+  Write-Host "TOKEN: $($script:Token.Substring(0,10))..." -ForegroundColor Gray
+  Write-Host "Vérification du compte…" -ForegroundColor Gray
+  
+  $me = Invoke-TrelloGet "$script:Base/members/me"
+  Write-Host "✅ Connecté : $($me.fullName) (@$($me.username))" -ForegroundColor Green
+  
+  # Sélection du board
+  Write-Host "`n=== SÉLECTION DU BOARD ===" -ForegroundColor Cyan
+  $board = Resolve-Board -Input ""
+  Write-Host "✅ Board : $($board.name) (shortLink=$($board.shortLink))" -ForegroundColor Green
+  
+  # Sélection de la liste
+  $list = Select-ListFromBoard -BoardId $board.id -AllowCreate $true
+  if (-not $list) {
+    throw "❌ Aucune liste sélectionnée."
   }
   
-  # Utiliser l'ID de label déjà récupéré ou le créer
-  if ($selectedLabel -and $selectedLabel.id) {
-    $labelId = $selectedLabel.id
-    Write-Host ("✅ Label: {0} ({1}) - ID récupéré" -f $LabelName, $labelId) -ForegroundColor Green
-  } else {
-    $labelId = Get-OrCreate-LabelId -BoardId $BoardId -Name $LabelName -Color $LabelColor
-    if ($LabelName) { Write-Host ("✅ Label: {0} ({1}) couleur={2} - ID créé" -f $LabelName, $labelId, $LabelColor) -ForegroundColor Green } else { Write-Host "Aucun label spécifié" -ForegroundColor Gray }
-  }
+  # Choix du mode
+  Write-Host "`n=== MODE DE CRÉATION ===" -ForegroundColor Cyan
+  Write-Host "Choisissez le mode de création des cartes :" -ForegroundColor Yellow
+  Write-Host "  [1] Mode par défaut (cartes + labels prédéfinis automatiquement)" -ForegroundColor White
+  Write-Host "  [2] Mode personnalisé (création manuelle carte par carte)" -ForegroundColor White
   
-  Write-Host "`n=== CRÉATION DES CARTES ===" -ForegroundColor Cyan
-  $created=@(); $errors=@(); $i=0; $n=$Cards.Count
-  foreach ($c in $Cards) {
-    $i++
-    Write-Host ("[{0}/{1}] {2}" -f $i,$n,$c.title) -ForegroundColor Gray
-    try {
-      $card = New-TrelloCard -Title $c.title -Desc $c.desc -ListId $listId
-      if ($labelId) {
-        Add-LabelToCard -CardId $card.id -LabelId $labelId
-      }
-      Add-Checklist -CardId $card.id -ChecklistName $ChecklistName -Items $c.dod
-      $created += [PSCustomObject]@{ Title=$c.title; Url=$card.shortUrl }
-      Write-Host "  ✅ Carte créée" -ForegroundColor Green
-    } catch {
-      $errors  += [PSCustomObject]@{ Title=$c.title; Error=$_.ToString() }
-      Write-Warning "  ❌ Erreur: $($_.Exception.Message)"
+  $modeChoice = Read-Host "Votre choix (1/2)"
+  
+  if ($modeChoice -eq "1") {
+    # ========== MODE PAR DÉFAUT ==========
+    Write-Host "`n✅ Mode par défaut activé" -ForegroundColor Green
+    Write-Host "Les labels et cartes seront créés automatiquement avec la configuration prédéfinie." -ForegroundColor Gray
+    
+    # Récupérer les labels existants
+    $existingLabels = Get-BoardLabels -BoardId $board.id
+    if (-not $existingLabels) {
+      $existingLabels = @()
     }
-    Start-Sleep -Seconds $SleepBetween
+    
+    # Map des couleurs de labels
+    $LabelColorMap = @{
+      "Dashboard" = "blue"
+      "KPI" = "green"
+      "Graphiques" = "orange"
+      "Alertes" = "red"
+    }
+    
+    # Création des cartes avec leurs labels
+    Write-Host "`n=== CRÉATION DES CARTES (MODE PAR DÉFAUT) ===" -ForegroundColor Cyan
+    $created = @()
+    $errors = @()
+    
+    $i = 1
+    foreach ($spec in $CardsSpec) {
+      Write-Host "[$i/$($CardsSpec.Count)] $($spec.Name)" -ForegroundColor Yellow
+      
+      try {
+        # Déterminer le label pour cette carte
+        $labelName = switch ($spec.Name) {
+          "KPI par rôle" { "KPI" }
+          "Graphes" { "Graphiques" }
+          "Alertes" { "Alertes" }
+          default { "Dashboard" }
+        }
+        $labelColor = $LabelColorMap[$labelName]
+        
+        # Créer/récupérer le label
+        $labelId = Ensure-Label -BoardId $board.id -ExistingLabels ([ref]$existingLabels) -Name $labelName -Color $labelColor
+        
+        # Créer la carte
+        $labelIds = if ($labelId) { @($labelId) } else { @() }
+        $card = New-TrelloCard -ListId $list.id -Name $spec.Name -Desc $spec.Desc -LabelIds $labelIds
+        Write-Host "  ✅ Carte créée" -ForegroundColor Green
+        
+        # Ajouter le label
+        if ($labelId) {
+          Write-Host "  🏷️ Label '$labelName' appliqué" -ForegroundColor Gray
+        }
+        
+        # Créer la checklist
+        if ($spec.Tasks) {
+          $checklist = New-TrelloChecklist -CardId $card.id -Name "Tâches"
+          Write-Host "  📋 Checklist créée" -ForegroundColor Gray
+          
+          foreach ($task in $spec.Tasks) {
+            Add-TrelloCheckItem -ChecklistId $checklist.id -Name $task | Out-Null
+          }
+          Write-Host "  ✅ $($spec.Tasks.Count) tâche(s) ajoutée(s)" -ForegroundColor Gray
+        }
+        
+        $created += $card
+      } catch {
+        Write-Host "  ❌ Erreur : $_" -ForegroundColor Red
+        $errors += @{ Name = $spec.Name; Error = $_ }
+      }
+      
+      $i++
+    }
+    
+  } else {
+    # ========== MODE PERSONNALISÉ ==========
+    Write-Host "`n✅ Mode personnalisé activé" -ForegroundColor Green
+    Write-Host "Vous allez créer les cartes une par une manuellement." -ForegroundColor Gray
+    
+    # Récupérer les labels existants
+    $existingLabels = Get-BoardLabels -BoardId $board.id
+    if (-not $existingLabels) {
+      $existingLabels = @()
+    }
+    
+    Write-Host "`n=== CRÉATION DES CARTES (MODE PERSONNALISÉ) ===" -ForegroundColor Cyan
+    $created = @()
+    $errors = @()
+    
+    do {
+      $card = Create-CustomCard -ListId $list.id -BoardId $board.id -ExistingLabels ([ref]$existingLabels)
+      
+      if ($card) {
+        $created += $card
+      }
+      
+      Write-Host "`nCréer une autre carte ? (O/n)" -ForegroundColor Yellow
+      $continueCreating = Read-Host
+      
+    } while ($continueCreating -eq "" -or $continueCreating -eq "O" -or $continueCreating -eq "o")
   }
   
+  # Résumé
   Write-Host "`n=== RÉCAP ===" -ForegroundColor Cyan
-  Write-Host ("✅ Créées: {0} | ❌ Erreurs: {1}" -f $created.Count, $errors.Count) -ForegroundColor White
+  Write-Host "✅ Créées: $($created.Count) | ❌ Erreurs: $($errors.Count)" -ForegroundColor $(if ($errors.Count -eq 0) { "Green" } else { "Yellow" })
   
   if ($created.Count -gt 0) {
     Write-Host "`n--- CARTES CRÉÉES ---" -ForegroundColor Green
-    $created | Format-Table -AutoSize Title, Url
+    $created | Format-Table @{
+      Label = "Title"
+      Expression = { $_.name }
+    }, @{
+      Label = "Url"
+      Expression = { $_.shortUrl }
+    } -AutoSize
   }
   
   if ($errors.Count -gt 0) {
     Write-Host "`n--- ERREURS ---" -ForegroundColor Red
-    $errors | Format-Table -AutoSize Title, Error
-  }
-  
-  # Sauvegarder la configuration du board
-  $saveBoardConfig = Read-Host "`nSauvegarder la configuration de ce board pour la prochaine fois ? (O/n)"
-  if ($saveBoardConfig -eq "" -or $saveBoardConfig -eq "O" -or $saveBoardConfig -eq "o") {
-    Save-BoardConfig -BoardUrl $BoardUrl -ListName $TargetListName -LabelName $LabelName -LabelColor $LabelColor
+    foreach ($err in $errors) {
+      Write-Host "❌ $($err.Name) : $($err.Error)" -ForegroundColor Red
+    }
   }
   
   Write-Host "`n🎉 Script terminé avec succès !" -ForegroundColor Green
-  Write-Host "Appuyez sur Entrée pour continuer..." -ForegroundColor Cyan
-  Read-Host
   
 } catch {
-  Write-Host "`n❌ ERREUR CRITIQUE : $($_.Exception.Message)" -ForegroundColor Red
-  Write-Host "`nVérifiez que :" -ForegroundColor Yellow
-  Write-Host "1. Votre KEY Trello est correcte" -ForegroundColor Yellow
-  Write-Host "2. Votre TOKEN Trello est correcte" -ForegroundColor Yellow
-  Write-Host "3. Vous avez accès au board spécifié" -ForegroundColor Yellow
-  Write-Host "4. Votre connexion internet fonctionne" -ForegroundColor Yellow
+  Write-Host "`n❌ ERREUR FATALE" -ForegroundColor Red
+  Write-Host $_ -ForegroundColor Red
   
-  # Ne pas fermer PowerShell ISE, juste afficher l'erreur
-  Write-Host "`nAppuyez sur Entrée pour continuer..." -ForegroundColor Cyan
-  Read-Host
+  if ($_.Exception.Response) {
+    try {
+      $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+      $errBody = $reader.ReadToEnd()
+      Write-Host "Détails de l'erreur API :" -ForegroundColor Yellow
+      Write-Host $errBody -ForegroundColor Red
+    } catch {}
+  }
+  
+  throw
 }
